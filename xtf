@@ -1,0 +1,366 @@
+#!/bin/bash
+
+# Autor: Ronald Bednár <xbednar00>
+
+# Logika skriptu je popísaná komentármi vo funkcii 'list_currency'.
+# Pri ostatných funkciách pre príkazy sa komentáre nachádzajú len na miestach, kde sa líšia od 'list_currency'.
+
+# Deklarácia premenných.
+date_after=""
+date_before=""
+currencies_allowed=()
+command=""
+user=""
+logs=()
+
+# Kontrola hodnoty XTF_PROFIT, nastavenie na predvolenú hodnotu "20" v prípade, že ešte nebola nastavená.
+if [ -z "${XTF_PROFIT}" ]; then
+    XTF_PROFIT=20
+fi
+
+# Funkcia na zobrazenie nápovedy.
+help() {
+    echo "Použitie: xtf [-h|--help] [FILTER] [PRÍKAZ] UŽIVATEĽ LOG [LOG [...]]"
+    echo
+    echo "Prepínače (filtre):"
+    echo "  < -b DATETIME > - jsou uvažovány pouze záznamy PŘED tímto datem a časem (bez něj)."
+    echo "  < -a DATETIME > - jsou uvažovány pouze záznamy PO tomto datu a čase (bez něj). "
+    echo "  < -c CURRENCY > - jsou uvažovány pouze záznamy odpovídající dané měně."
+    echo "  < -h a --help > - vypíšou nápovědu s krátkým popisem každého příkazu a přepínače."
+    echo
+    echo "Príkazy:"
+    echo "  <list> - výpis záznamů pro daného uživatele."
+    echo "  <list-currency> - výpis seřazeného seznamu vyskytujících se měn."
+    echo "  <status> - výpis skutečného stavu účtu seskupeného a seřazeného dle jednotlivých měn."
+    echo "  <profit> - výpis stavu účtu zákazníka se započítaným fiktivním výnosem (default = 20%)."
+}
+
+# Funkcia na čítanie obsahu daného súboru.
+read_file() { 
+    if [[ $log == *.gz ]]; then # Ak sa súbor končí na .gz použije sa gzip na dekomprimáciu a čítanie obsahu.
+        gzip -dc "$log"
+    else # Inak sa súbor číta priamo.
+        cat "$log"
+    fi
+}
+
+# Funkcia na overenie formátu dátumu z argumentu (YYYY-MM-DD HH:MM:SS).
+validate_date() {
+    local date="$1"
+    if ! date -j -f "%Y-%m-%d %H:%M:%S" "$date" &>/dev/null; then
+        echo "Chyba: Neplatný formát dátumu vo filtri!" >/dev/stderr
+        exit 1
+    fi
+}
+
+# Funkcia na overenie formátu meny z argumentu (presne 3 znaky [A-Z]).
+validate_currency() {
+    local currency="$1"
+    if ! [[ $currency =~ ^[A-Z]{3}$ ]]; then
+        echo "Chyba: Neplatný formát meny vo filtri -c!" >/dev/stderr
+        exit 1
+    fi
+}
+
+# Funkcia na konverziu dátumu na unixový čas.
+convert_date() {
+    timestamp=$(date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null)
+    echo "$timestamp"
+}
+
+# Funkcia na kontrolu platnosti a správnosti formátu 'LOG' súboru.
+validate_log(){
+    # Najprv sa skontroluje existencia (platnosť) súboru.
+    if [[ ! -f "$log" ]]; then 
+        echo "Chyba: súbor: \"$log\" neexistuje alebo sa nedá otvoriť !" >/dev/stderr
+        exit 1
+    # Potom sa skontroluje formát (vnútorná štruktúra) súboru.
+    elif [[ "$log" =~ \.gz$ ]]; then 
+        # Ak má súbor koncovku .gz, tak sa najprv použije gunzip, potom pipeline na awk pre kontrolu jeho formátu.
+        if ! gunzip -c "$log" | awk -F';' -v logname="$log" 'NF != 4 || length($1) == 0 || !($2 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/) || length($3) != 3 || !($3 ~ /^[a-zA-Z]{3}$/) || !($4 ~ /^-?[0-9]+\.?[0-9]*$/) { 
+            print "Chyba: Nesprávny formát dát v logu: \""logname"\" na riadku: " NR ". !" > "/dev/stderr"; 
+            exit 1 
+        }'; then
+            exit 1
+        fi
+    else
+        # Kontrola formátu súboru. (JMENO UZIVATELE;DATUM A CAS;MENA;HODNOTA)
+        if ! awk -F';' -v logname="$log" 'NF != 4 || length($1) == 0 || !($2 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/) || length($3) != 3 || !($3 ~ /^[a-zA-Z]{3}$/) || !($4 ~ /^-?[0-9]+\.?[0-9]*$/) {
+            print "Chyba: Nesprávny formát dát v logu: \""FILENAME"\" na riadku: " NR ". !" > "/dev/stderr"; 
+            exit 1 
+        }' "$log"; then
+            exit 1
+        fi
+    fi
+}
+
+# Cyklus na postupné spracovanie všetkých vstupných argumentov.
+# Po spracovaní každého argumentu sa zavolá shift (1 pre command a log; 2 pre filtre a user).
+# Týmto spôsobom môžu byť argumenty zadané v ľubovoľnom poradí a budu správne spracované.
+# Podľa zadania vychádzame z predpokladu, že 'LOG' bude vždy zadávaný ako v poradí posledný argument.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a) # Ak je aktuálne na pozícii 1. argumentu -a, tak sa filtrovaný dátum zapíše do 'date_after'.
+            validate_date "$2" # Overenie platnosti dátumu z argumentu.
+            if [ -z "$date_after" ]; then
+                date_after=$2
+                shift 2
+            else # Ak bol do 'date_after' opakovane zapisaný dátum, vypíše sa chybové hlásenie.
+                echo "Chyba: Duplicitné zadanie filtru -a !" >/dev/stderr
+                exit 1
+            fi
+            ;;
+        -b) # Ak je aktuálne na pozícii 1. argumentu -b, tak sa filtrovaný dátum zapíše do 'date_before'.
+            validate_date "$2" # Overenie platnosti dátumu z argumentu.
+            if [ -z "$date_before" ]; then
+                date_before=$2
+                shift 2
+            else # Ak bol do 'date_before' opakovane zapisaný dátum, vypíše sa chybové hlásenie.
+                echo "Chyba: Duplicitné zadanie filtru -b !" >/dev/stderr
+                exit 1
+            fi
+            ;;
+        -c) # Ak je aktuálne na pozícii 1. argumentu -c, tak sa kód požadovanej meny zapíše do poľa 'currencies_allowed'.
+            validate_currency "$2"
+            currencies_allowed+=("$2")
+            shift 2
+            ;;
+        -h|--help) # Ak je aktuálne na pozícii 1. argumentu -h(--help), tak sa vypíše nápoveda.
+            help
+            exit 0
+            ;;
+        # Ak je aktuálne ne pozícii 1. argumentu niektorý z platných príkazov, tak sa daný príkaz zapíše do 'command'.
+        list|list-currency|status|profit) 
+            if [ -z "$command" ]; then
+                command=$1
+                shift 1
+            else # Pri pokuse o duplicitné zadanie príkazu sa vypíše chybové hlásenie.
+                echo "Chyba: Duplicitné zadanie parametra 'PRÍKAZ' !" >/dev/stderr
+                exit 1
+            fi
+            ;;
+        # Podľa zadania vychádzame z predpokladu, že 'LOG' bude vždy zadávaný ako v poradí posledný argument.
+        *) # Ak je aktuálne na pozícii 1. argumentu čokoľvek iné, tak sa daný výraz zapíše do 'user'.
+            if [ -z "$user" ]; then
+                user=$1
+                shift 1
+            else # Ak už bol do 'user' zapisaný výraz, všetky ostatné argumenty budú zapísane do poľa 'logs'.
+                logs+=("$1")
+                shift 1
+            fi
+            ;;
+    esac
+done
+
+# Ak po spracovaní všetkých argumentov stále nebol nastavený 'command', nastaví sa na predvolený príkaz - "list".
+if [ -z "$command" ]; then
+    command=list
+fi
+
+# Kontrola prípadnej absencie povinných argumentov 'USER' a 'LOG'.
+if [[ -z "$user" || ${#logs[@]} -eq 0 ]]; then
+    echo "Chyba: Nezadali ste 'UŽIVATEĽ' alebo 'LOG' !" >/dev/stderr
+    exit 1
+fi
+
+# Cyklus prejde všetky zadané 'LOG' súbory a skontroluje ich platnosť a správnosť ich formátu.
+for log in "${logs[@]}"; do
+    validate_log "$log"
+done
+
+list_currency() {
+    currencies_to_print=() # Pole na uchovávanie mien pre účel ich zoradenia pred výpisom.
+    # Iterácia cez všetky log súbory uložené v poli 'logs'.
+    for log in "${logs[@]}"; do
+        # Cyklus číta súbory riadok po riadku.
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Rozdelenie riadku na jednotlivé sekcie oddelené znakom ';' a priradenie hodnôt premenným.
+            IFS=';' read -r user_log date_log currency_log amount_log <<< "$line" # Obsah z premennej 'line' je presmerovaný do 'read'.
+
+            # Ak meno užívateľa v logu nezodpovedá zadanému užívateľovi, preskočí sa na ďalší riadok.
+            if [ "$user_log" != "$user" ]; then
+                continue
+            fi
+
+            # Konverzia dátumov na unixový čas.
+            local tstamp_current=$(convert_date "$date_log")
+            local tstamp_after=$(convert_date "$date_after")
+            local tstamp_before=$(convert_date "$date_before")
+            
+            # Ak je dátum logu menší alebo rovný ako filter -a, preskočí sa na ďalší riadok.
+            if [[ -n "$date_after" && "$tstamp_current" -le "$tstamp_after" ]]; then
+                continue
+            fi
+
+            # Ak je dátum logu väčší alebo rovný ako filter -b, preskočí sa na ďalší riadok.
+            if [[ -n "$date_before" && "$tstamp_current" -ge "$tstamp_before" ]]; then
+                continue
+            fi
+            
+            # Filtrácia podľa meny (ak bol zadaný filter -c).
+            if [[ ${#currencies_allowed[@]} -gt 0 && ! " ${currencies_allowed[@]} " =~ " ${currency_log} " ]]; then
+                continue
+            fi
+            
+            # Ak riadok prejde cez všetky filtre, mena z daného riadku sa pridá do 'currencies_to_print'
+            currencies_to_print+=("$currency_log") 
+        done < <(read_file "$log") # Výstup funkcie read_file je presmerovaný do while cyklu
+    done
+
+    # Výpis mien zoradený abecedne a bez duplikátov (pomocou pipeline na sort).
+    printf "%s\n" "${currencies_to_print[@]}" | sort -u
+}
+
+list() {
+    for log in "${logs[@]}"; do
+        while IFS= read -r line || [ -n "$line" ]; do
+            IFS=';' read -r user_log date_log currency_log amount_log <<< "$line"
+            
+            if [ "$user_log" != "$user" ]; then
+                continue
+            fi
+            
+            local tstamp_current=$(convert_date "$date_log")
+            local tstamp_after=$(convert_date "$date_after")
+            local tstamp_before=$(convert_date "$date_before")
+            
+            if [[ -n "$date_after" && "$tstamp_current" -le "$tstamp_after" ]]; then
+                continue
+            fi
+
+            if [[ -n "$tstamp_current" && -n "$tstamp_before" && "$tstamp_current" -ge "$tstamp_before" ]]; then
+                continue
+            fi
+            
+            if [[ ${#currencies_allowed[@]} -gt 0 && ! " ${currencies_allowed[@]} " =~ " ${currency_log} " ]]; then
+                continue
+            fi
+            
+            # Ak riadok prejde cez všetky filtre, daný riadok sa vypíše.
+            echo "$line" 
+        done < <(read_file "$log")
+    done
+}
+
+status() {
+    declare -a uniq_currencies=() # Pole pre uchovávanie kódov mien.
+    declare -a balances=() # Pole pre uchovávanie súčtov hodnôt pre každú menu.
+
+    for log in "${logs[@]}"; do
+        while IFS= read -r line || [ -n "$line" ]; do
+            IFS=';' read -r user_log date_log currency_log amount_log <<< "$line"
+
+            if [ "$user_log" != "$user" ]; then
+                continue
+            fi
+
+            local tstamp_current=$(convert_date "$date_log")
+            local tstamp_after=$(convert_date "$date_after")
+            local tstamp_before=$(convert_date "$date_before")
+            
+            if [[ -n "$date_after" && "$tstamp_current" -le "$tstamp_after" ]]; then
+                continue
+            fi
+
+            if [[ -n "$date_before" && "$tstamp_current" -ge "$tstamp_before" ]]; then
+                continue
+            fi
+            
+            if [[ ${#currencies_allowed[@]} -gt 0 && ! " ${currencies_allowed[@]} " =~ " ${currency_log} " ]]; then
+                continue
+            fi
+
+            idx=-1
+            # Cyklus prechádza všetkými prvkami poľa 'uniq_currencies'
+            for i in "${!uniq_currencies[@]}"; do
+                # Ak sa mena na danom riadku zhoduje s nejaou menou z poľa, tak sa idx nastaví na hodnotu i (pozícia meny v 'uniq_currencies')
+                if [[ "${uniq_currencies[$i]}" == "$currency_log" ]]; then
+                    idx=$i
+                    break
+                fi
+            done
+
+            # Ak idx=-1, ide o prvý výskyt tejto meny.
+            # Mena sa následne pridá do 'uniq_currencies' a hodnota transakcie sa zapíše do 'balances' na zhodnú pozíciu v poli.
+            if [[ $idx -eq -1 ]]; then
+                uniq_currencies+=("$currency_log")
+                balances+=("$amount_log")
+            else
+                # Ak je index rôzny od -1, ide o opakovaný výskyt danej meny
+                # Preto sa do poľa 'balances' na pozíciu idx pripočíta hodnota tejto transakcie.
+                balances[$idx]=$(echo "${balances[$idx]} + $amount_log" | bc)
+            fi
+        done < <(read_file "$log")
+    done
+
+    # Výpis kódov mien a finálnych hodnôt pre každú menu zoradený abecedne.
+    for i in "${!uniq_currencies[@]}"; do
+        echo "${uniq_currencies[$i]} : ${balances[$i]}"
+    done | sort
+}
+
+profit() {
+    declare -a uniq_currencies=()
+    declare -a balances=()
+
+    for log in "${logs[@]}"; do
+        while IFS= read -r line || [ -n "$line" ]; do
+            IFS=';' read -r user_log date_log currency_log amount_log <<< "$line"
+
+            if [ "$user_log" != "$user" ]; then
+                continue
+            fi
+
+            local tstamp_current=$(convert_date "$date_log")
+            local tstamp_after=$(convert_date "$date_after")
+            local tstamp_before=$(convert_date "$date_before")
+            
+            if [[ -n "$date_after" && "$tstamp_current" -le "$tstamp_after" ]]; then
+                continue
+            fi
+
+            if [[ -n "$date_before" && "$tstamp_current" -ge "$tstamp_before" ]]; then
+                continue
+            fi
+            
+            if [[ ${#currencies_allowed[@]} -gt 0 && ! " ${currencies_allowed[@]} " =~ " ${currency_log} " ]]; then
+                continue
+            fi
+
+            idx=-1
+            for i in "${!uniq_currencies[@]}"; do
+                if [[ "${uniq_currencies[$i]}" == "$currency_log" ]]; then
+                    idx=$i
+                    break
+                fi
+            done
+
+            if [[ $idx -eq -1 ]]; then
+                uniq_currencies+=("$currency_log")
+                balances+=("$amount_log")
+            else
+                balances[$idx]=$(echo "${balances[$idx]} + $amount_log" | bc)
+            fi
+        done < <(read_file "$log")
+    done
+
+    for i in "${!uniq_currencies[@]}"; do
+        # Ak je hodnota prvku z poľa 'balances' väčšia ako 0, vynásobí sa násobiteľom (1+XTF_PROFIT/100).
+        if (( $(echo "${balances[$i]} > 0" | bc -l) )); then
+            profit_multip=$(echo "scale = 2; 1 + ($XTF_PROFIT / 100)" | bc)
+            balances[$i]=$(echo "scale= 4; ${balances[$i]} * $profit_multip" | bc)
+        fi
+        echo "${uniq_currencies[$i]} : ${balances[$i]}"
+    done | sort
+}
+
+# Volanie prislúchajúcich funkcií pre jednotlivé príkazy.
+if [ "$command" == "list" ]; then
+    list "$user" "${logs[@]}"
+elif [ "$command" == "list-currency" ]; then
+    list_currency "$user" "${logs[@]}"
+elif [ "$command" == "status" ]; then
+    status "$user" "${logs[@]}"
+elif [ "$command" == "profit" ]; then
+    profit "$user" "${logs[@]}"
+fi
